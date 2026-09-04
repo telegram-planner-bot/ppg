@@ -50,6 +50,16 @@ async def init_db():
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                remind_at TEXT NOT NULL,
+                sent INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         await db.commit()
 
 
@@ -84,14 +94,15 @@ async def add_task(
     title: str,
     due_at: datetime,
     category: str,
-    remind_minutes_before: int,
 ):
-    remind_at = due_at - timedelta(minutes=remind_minutes_before)
+    # Столбцы remind_at/reminded в tasks — устаревшие (оставлены только
+    # для совместимости со старой схемой), реальные напоминания теперь
+    # хранятся в таблице reminders (их может быть несколько на одно дело).
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
             INSERT INTO tasks (user_id, chat_id, title, due_at, category, remind_at, reminded, done, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)
             """,
             (
                 user_id,
@@ -99,12 +110,21 @@ async def add_task(
                 title,
                 due_at.isoformat(),
                 category,
-                remind_at.isoformat(),
+                due_at.isoformat(),
                 now().isoformat(),
             ),
         )
         await db.commit()
         return cur.lastrowid
+
+
+async def add_reminders(task_id: int, remind_ats: list[datetime]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT INTO reminders (task_id, remind_at, sent) VALUES (?, ?, 0)",
+            [(task_id, dt.isoformat()) for dt in remind_ats],
+        )
+        await db.commit()
 
 
 async def get_pending_tasks(user_id: int, category: str | None = None):
@@ -152,24 +172,27 @@ async def mark_done(task_id: int):
 async def delete_task(task_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM reminders WHERE task_id = ?", (task_id,))
         await db.commit()
 
 
 async def get_due_reminders():
-    """Задачи, для которых пора отправить напоминание."""
+    """Напоминания, которые пора отправить (у одного дела их может быть несколько)."""
     current = now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            SELECT id, chat_id, title, due_at, category FROM tasks
-            WHERE done = 0 AND reminded = 0 AND remind_at <= ?
+            SELECT r.id, t.chat_id, t.title, t.due_at, t.category, r.remind_at
+            FROM reminders r
+            JOIN tasks t ON t.id = r.task_id
+            WHERE r.sent = 0 AND t.done = 0 AND r.remind_at <= ?
             """,
             (current,),
         )
         return await cur.fetchall()
 
 
-async def mark_reminded(task_id: int):
+async def mark_reminder_sent(reminder_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE tasks SET reminded = 1 WHERE id = ?", (task_id,))
+        await db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
         await db.commit()

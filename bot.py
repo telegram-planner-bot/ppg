@@ -85,6 +85,36 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+REMIND_OPTIONS = [15, 30, 60, 120, 180, 1440]
+
+
+def remind_label(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes} мин"
+    if minutes < 1440:
+        hours = minutes // 60
+        return f"{hours} ч" if minutes % 60 == 0 else f"{minutes} мин"
+    days = minutes // 1440
+    return f"{days} день" if days == 1 else f"{days} дн."
+
+
+def task_remind_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for m in REMIND_OPTIONS:
+        mark = "✅ " if m in selected else ""
+        row.append(
+            InlineKeyboardButton(text=f"{mark}{remind_label(m)}", callback_data=f"toggle:{m}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Готово ✔️", callback_data="remindsdone")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def task_actions_keyboard(task_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -173,6 +203,7 @@ class AddTask(StatesGroup):
     title = State()
     when = State()
     category = State()
+    remind = State()
 
 
 # ---------------------------------------------------------------------------
@@ -252,26 +283,63 @@ async def add_task_when(message: Message, state: FSMContext):
 @router.callback_query(AddTask.category, F.data.startswith("cat:"))
 async def add_task_category(callback: CallbackQuery, state: FSMContext):
     category = callback.data.split(":", 1)[1]
+    default_minutes = await db.get_remind_minutes(callback.from_user.id)
+    await state.update_data(category=category, selected_reminds=[default_minutes])
+    await state.set_state(AddTask.remind)
+
+    await callback.message.edit_text(
+        f"{db.CATEGORIES[category]}\n\n"
+        "За сколько напомнить об этом деле? Можно выбрать сразу несколько "
+        "вариантов — например «1 день» и «3 ч», чтобы не забыть накануне "
+        "и незадолго до начала. Нажимайте варианты, потом «Готово».",
+        reply_markup=task_remind_keyboard({default_minutes}),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddTask.remind, F.data.startswith("toggle:"))
+async def add_task_toggle_remind(callback: CallbackQuery, state: FSMContext):
+    minutes = int(callback.data.split(":", 1)[1])
     data = await state.get_data()
+    selected = set(data.get("selected_reminds", []))
+    if minutes in selected:
+        selected.discard(minutes)
+    else:
+        selected.add(minutes)
+    await state.update_data(selected_reminds=list(selected))
+    await callback.message.edit_reply_markup(reply_markup=task_remind_keyboard(selected))
+    await callback.answer()
+
+
+@router.callback_query(AddTask.remind, F.data == "remindsdone")
+async def add_task_remind_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get("selected_reminds", [])
+    if not selected:
+        await callback.answer("Выберите хотя бы один вариант.", show_alert=True)
+        return
+
     title = data["title"]
     due_at = datetime.fromisoformat(data["due_at"])
+    category = data["category"]
 
-    remind_minutes = await db.get_remind_minutes(callback.from_user.id)
-    await db.add_task(
+    task_id = await db.add_task(
         user_id=callback.from_user.id,
         chat_id=callback.message.chat.id,
         title=title,
         due_at=due_at,
         category=category,
-        remind_minutes_before=remind_minutes,
     )
+    remind_ats = sorted({due_at - timedelta(minutes=m) for m in selected})
+    await db.add_reminders(task_id, remind_ats)
     await state.clear()
 
+    labels = ", ".join(remind_label(m) for m in sorted(selected, reverse=True))
     await callback.message.edit_text(
         f"Готово! Дело «{title}» добавлено.\n"
         f"📌 {db.CATEGORIES[category]}\n"
         f"🕒 {due_at.strftime('%d.%m.%Y %H:%M')}\n"
-        f"🔔 Напомню за {remind_minutes} мин. до дела."
+        f"🔔 Напомню за: {labels} до дела."
     )
     await callback.answer()
 
@@ -362,19 +430,22 @@ async def reminder_loop(bot: Bot):
     while True:
         try:
             due = await db.get_due_reminders()
-            for task_id, chat_id, title, due_at, category in due:
+            for reminder_id, chat_id, title, due_at, category, remind_at in due:
                 dt = datetime.fromisoformat(due_at)
+                left = dt - datetime.fromisoformat(remind_at)
+                left_minutes = round(left.total_seconds() / 60)
                 text = (
                     "🔔 Напоминание!\n\n"
                     f"{db.CATEGORIES[category]}\n"
-                    f"🕒 {dt.strftime('%d.%m.%Y %H:%M')}\n"
+                    f"🕒 {dt.strftime('%d.%m.%Y %H:%M')} "
+                    f"(через {remind_label(left_minutes)})\n"
                     f"{title}"
                 )
                 try:
                     await bot.send_message(chat_id, text)
                 except Exception as e:
                     logger.warning("Не удалось отправить напоминание: %s", e)
-                await db.mark_reminded(task_id)
+                await db.mark_reminder_sent(reminder_id)
         except Exception:
             logger.exception("Ошибка в цикле напоминаний")
         await asyncio.sleep(30)
